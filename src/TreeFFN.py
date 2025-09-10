@@ -65,32 +65,26 @@ class TreeFFN(nn.Module):
         self._cache.clear()
         self._cache_valid = False
 
-    def _compute_edge_features(self, h: torch.Tensor, edge_index: torch.LongTensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _compute_edge_features(self, h: torch.Tensor, edge_index: torch.LongTensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
-        优化的边特征计算 - 支持缓存
+        优化的边特征计算 - 移除无效缓存，专注计算优化
         """
-        cache_key = f"edge_feats_{edge_index.shape[1]}_{h.shape[0]}"
-        
-        # 检查缓存
-        if self._cache_valid and cache_key in self._cache and torch.equal(edge_index, self._last_edge_index):
-            p_idx, c_idx = self._cache[cache_key]
-        else:
-            p_idx = edge_index[0]   # 父节点索引
-            c_idx = edge_index[1]   # 子节点索引
-            self._cache[cache_key] = (p_idx, c_idx)
-            self._last_edge_index = edge_index.clone()
+        # 直接计算，不使用复杂缓存
+        p_idx = edge_index[0]   # 父节点索引
+        c_idx = edge_index[1]   # 子节点索引
         
         # 批量获取父子节点特征
         h_p = h[p_idx]  # [E, d_h]
         h_c = h[c_idx]  # [E, d_h]
         
-        # 计算消息
+        # 计算消息 - 优化版本
         if self.use_edge_proj:
-            # 缓存concatenated features以避免重复计算
+            # 预计算concatenated features避免重复计算
             edge_concat = torch.cat([h_p, h_c], dim=1)  # [E, 2*d_h]
             msg = self.W_edge(edge_concat)  # [E, d_h]
             gate_input = edge_concat if self.use_gating else None
         else:
+            # 简单加法更快
             msg = h_p + h_c  # [E, d_h]
             gate_input = torch.cat([h_p, h_c], dim=1) if self.use_gating else None
         
@@ -105,17 +99,14 @@ class TreeFFN(nn.Module):
 
     def _aggregate_messages(self, msg: torch.Tensor, p_idx: torch.Tensor, c_idx: torch.Tensor, N: int) -> torch.Tensor:
         """
-        优化的消息聚合 - 减少内存分配
+        极简的消息聚合 - 移除复杂优化，专注速度
         """
-        # 预分配聚合tensor
+        # 直接使用scatter_add，最简单的方式
         agg = torch.zeros(N, msg.size(1), dtype=msg.dtype, device=msg.device)
         
-        # 单次scatter操作而不是两次分别的scatter
-        # 将parent和child索引合并处理
-        all_indices = torch.cat([p_idx, c_idx], dim=0)  # [2E]
-        all_messages = torch.cat([msg, msg], dim=0)     # [2E, d_h]
-        
-        agg = scatter_add(all_messages, all_indices, dim=0, dim_size=N)
+        # 分别处理父节点和子节点的消息聚合
+        agg.scatter_add_(0, p_idx.unsqueeze(1).expand(-1, msg.size(1)), msg)
+        agg.scatter_add_(0, c_idx.unsqueeze(1).expand(-1, msg.size(1)), msg)
         
         return agg
 
@@ -150,45 +141,33 @@ class TreeFFN(nn.Module):
                 edge_index: torch.LongTensor,  # [2, E]
                 root_idx: int = 0):
         """
-        优化的前向传播：消息传播优化 + 中间缓存
+        简化的前向传播：保持T可学习，简化其他计算
         """
         N = node_feats.size(0)
-        
-        # 检查是否需要重新计算缓存
-        if self._last_edge_index is None or not torch.equal(edge_index, self._last_edge_index):
-            self._invalidate_cache()
         
         # 初始隐藏状态
         h = self.W_s(node_feats)          # [N, d_h]
         
-        # 动态迭代次数 - 基于T参数
-        max_iterations = max(1, min(int(self.T.item()) + 1, 5))  # 限制最大迭代次数为5
+        # 使用可学习的T参数，但简化计算
+        max_iterations = max(1, min(int(self.T.item()) + 1, 3))  # 限制最大3次迭代
         
-        # 流式迭代处理
-        accumulated_h = torch.zeros_like(h)
-        
+        # 简化迭代处理 - 保持T的梯度
         for step_idx in range(max_iterations):
-            # 计算当前步骤的权重
+            # 计算当前步骤的权重（保持可学习）
             step_weight = torch.sigmoid(self.T - step_idx)
             
             # 执行单步前向传播
             step_h = self._streaming_forward_step(h, edge_index, N)
             
-            # 累积加权结果
-            accumulated_h = accumulated_h + step_weight * step_h
-            
-            # 更新h为下一步准备
-            h = step_h
+            # 加权更新（保持T的学习能力）
+            h = h + step_weight * (step_h - h)
             
             # 早期停止：如果权重太小，后续迭代贡献很小
-            if step_weight < 0.01:
+            if step_weight < 0.05:
                 break
-
-        # 标记缓存为有效
-        self._cache_valid = True
         
         # 最终隐藏状态
-        final_h = self.dropout(accumulated_h)
+        final_h = self.dropout(h)
 
         outputs = {}
         
