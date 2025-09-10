@@ -3,7 +3,7 @@
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/release/python-380/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache2.0](https://img.shields.io/badge/License-Apache2.0-yellow.svg)](https://opensource.org/licenses/Apache-2.0)
 
 > **A hybrid neural architecture combining transformer attention with global parent-child aggregation for efficient Abstract Syntax Tree (AST) processing and neural program synthesis.**
 
@@ -113,23 +113,30 @@ This will run comprehensive ablation studies testing different architectural com
 - Residual connections
 - Bidirectional propagation
 
-### Training on ARC Dataset
+### Training on ARC Dataset (Pure Autoregressive)
 
 ```bash
 python experiments/full_train_eval.py
 ```
 
-### Custom Training
+**Note**: TreeGPT now uses pure autoregressive training to eliminate train/test mismatch. This ensures consistent performance between training and inference phases.
+
+### Custom Training (Autoregressive Mode)
 
 ```python
 from src.arc_treegpt import train_arc_model, evaluate_arc_model
 
-# Train model
+# Train model using pure autoregressive training
 model = train_arc_model()
 
 # Evaluate performance
 results = evaluate_arc_model(model)
 ```
+
+**Key Features:**
+- **Pure Autoregressive Training**: No teacher forcing during training
+- **Streaming Computation**: Efficient autoregressive loss calculation
+- **Train/Test Consistency**: Training behavior matches inference behavior
 
 ## 📊 Results
 
@@ -190,7 +197,7 @@ TreeGPT/
 ├── figures/                     # Generated figures
 ├── arc-prize-2025/              # ARC dataset
 ├── requirements.txt             # Dependencies
-├── LICENSE                      # MIT license
+├── LICENSE                      # Apache 2.0 license
 └── README.md                    # This file
 ```
 
@@ -201,8 +208,9 @@ Our paper "TreeGPT: A Novel Hybrid Architecture for Abstract Syntax Tree Process
 **Key Contributions:**
 1. Novel hybrid architecture combining transformers with tree-structured processing
 2. Mathematically principled global parent-child aggregation mechanism  
-3. Superior performance on challenging visual reasoning benchmarks
-4. Comprehensive ablation studies revealing critical architectural components
+3. Pure autoregressive training methodology eliminating train/test mismatch
+4. Superior performance on challenging visual reasoning benchmarks
+5. Comprehensive ablation studies revealing critical architectural components
 
 ## 🤝 Contributing
 
@@ -255,7 +263,7 @@ If TreeGPT has helped your research or you'd like to support our work, consider 
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
 
 ## 🙏 Acknowledgments
 
