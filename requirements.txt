@@ -1,0 +1,22 @@
+# Core Dependencies
+torch>=2.0.0
+torch-scatter>=2.1.0
+numpy>=1.21.0
+
+# Data Processing
+json5>=0.9.0
+pathlib2>=2.3.0
+
+# Visualization and Logging
+matplotlib>=3.5.0
+logging>=0.4.9.6
+
+# Development and Testing (Optional)
+pytest>=7.0.0
+black>=22.0.0
+flake8>=4.0.0
+pre-commit>=2.17.0
+
+# Optional: For GPU acceleration
+# torch-geometric>=2.0.0  # Uncomment if using additional graph operations
+# tensorboard>=2.8.0      # Uncomment for experiment tracking
