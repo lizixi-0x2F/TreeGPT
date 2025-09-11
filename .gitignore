@@ -23,7 +23,7 @@ share/python-wheels/
 MANIFEST
 
 # PyTorch
-*.pth
+.pth
 *.pt
 *.ckpt
 checkpoints/
