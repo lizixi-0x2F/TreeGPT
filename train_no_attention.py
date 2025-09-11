@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Pure TreeFFN Seq2Seq Training - Official Implementation
-完全并行TreeFFN编码器-解码器架构 - 无注意力，无自回归
+纯TreeFFN Seq2Seq实验 - Encoder-Decoder架构
+完全消融attention和自回归，只用TreeFFN组件
 """
 
 import sys
@@ -9,6 +9,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import logging
@@ -17,14 +18,202 @@ import time
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
-from typing import Dict, List, Union, Tuple
+from typing import Dict, List, Union, Tuple, Optional
 
 from src.TreeGPT import *
 from src.arc_treegpt import *
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class TreeFFNSeq2SeqBlock(nn.Module):
+    """
+    简化的TreeFFN Seq2Seq Block - 只有Encoder + Decoder TreeFFN
+    """
+    
+    def __init__(self,
+                 d_model: int,
+                 dropout: float = 0.1,
+                 tree_iterations: int = 3):
+        super().__init__()
+        
+        # 编码器TreeFFN - 处理输入序列
+        self.encoder_tree_ffn = TreeFFN(
+            d_in=d_model,
+            d_h=d_model,
+            num_node_classes=None,
+            num_tree_classes=None,
+            use_edge_proj=True,
+            use_gating=True,
+            residual=True,
+            dropout=dropout,
+            tree_iterations=tree_iterations
+        )
+        
+        # 解码器TreeFFN - 生成输出序列
+        self.decoder_tree_ffn = TreeFFN(
+            d_in=d_model,
+            d_h=d_model,
+            num_node_classes=None,
+            num_tree_classes=None,
+            use_edge_proj=True,
+            use_gating=True,
+            residual=True,
+            dropout=dropout,
+            tree_iterations=tree_iterations
+        )
+        
+        # LayerNorms
+        self.ln_encoder = nn.LayerNorm(d_model)
+        self.ln_decoder = nn.LayerNorm(d_model)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        简化的并行seq2seq前向传播 - 只有编码器和解码器
+        x: [batch_size, seq_len, d_model]
+        """
+        batch_size, seq_len, d_model = x.shape
+        device = x.device
+        
+        # 1. 编码器：从左到右处理输入序列
+        encoder_edges = self._create_encoder_edges(seq_len, device)
+        encoder_outputs = []
+        
+        h_enc = self.ln_encoder(x)
+        for b in range(batch_size):
+            h_b = h_enc[b]  # [seq_len, d_model]
+            enc_out = self.encoder_tree_ffn(h_b, encoder_edges, root_idx=0)
+            
+            if 'hidden' in enc_out:
+                encoder_outputs.append(enc_out['hidden'])
+            else:
+                encoder_outputs.append(h_b)
+        
+        encoder_h = torch.stack(encoder_outputs, dim=0)
+        h = x + encoder_h
+        
+        # 2. 解码器：从右到左生成输出序列
+        decoder_edges = self._create_decoder_edges(seq_len, device)
+        decoder_outputs = []
+        
+        h_dec = self.ln_decoder(h)
+        for b in range(batch_size):
+            h_b = h_dec[b]  # [seq_len, d_model]
+            dec_out = self.decoder_tree_ffn(h_b, decoder_edges, root_idx=seq_len-1)  # 从最后一个节点开始
+            
+            if 'hidden' in dec_out:
+                decoder_outputs.append(dec_out['hidden'])
+            else:
+                decoder_outputs.append(h_b)
+        
+        decoder_h = torch.stack(decoder_outputs, dim=0)
+        h = h + decoder_h
+        
+        return h
+    
+    def _create_encoder_edges(self, seq_len: int, device: torch.device) -> torch.LongTensor:
+        """编码器边：从左到右的相邻连接"""
+        edges = []
+        for i in range(seq_len - 1):
+            edges.append([i, i + 1])
+        
+        if not edges:
+            edges.append([0, 0])
+        
+        return torch.tensor(edges, dtype=torch.long, device=device).t()
+    
+    def _create_decoder_edges(self, seq_len: int, device: torch.device) -> torch.LongTensor:
+        """解码器边：从右到左的相邻连接"""
+        edges = []
+        for i in range(seq_len - 1, 0, -1):
+            edges.append([i, i - 1])
+        
+        if not edges:
+            edges.append([0, 0])
+        
+        return torch.tensor(edges, dtype=torch.long, device=device).t()
+
+
+class TreeFFNSeq2Seq(nn.Module):
+    """
+    纯TreeFFN的Seq2Seq模型 - 完全并行，无自回归
+    """
+    
+    def __init__(self,
+                 vocab_size: int,
+                 d_model: int = 256,
+                 n_layers: int = 3,
+                 max_seq_len: int = 8192,
+                 dropout: float = 0.1,
+                 tree_iterations: int = 3):
+        super().__init__()
+        
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
+        
+        # Embeddings
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.position_embedding = nn.Embedding(max_seq_len, d_model)
+        
+        # TreeFFN Seq2Seq blocks
+        self.blocks = nn.ModuleList([
+            TreeFFNSeq2SeqBlock(
+                d_model=d_model,
+                dropout=dropout,
+                tree_iterations=tree_iterations
+            ) for _ in range(n_layers)
+        ])
+        
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        
+        # 权重初始化
+        self.apply(self._init_weights)
+        
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+    
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        纯并行seq2seq前向传播 - 一次处理整个序列
+        input_ids: [batch_size, seq_len]
+        """
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+        
+        # 位置编码
+        positions = torch.arange(0, seq_len, device=device).unsqueeze(0)
+        
+        # Token + Position embeddings
+        token_emb = self.token_embedding(input_ids)
+        pos_emb = self.position_embedding(positions)
+        h = token_emb + pos_emb
+        
+        # 通过TreeFFN Seq2Seq blocks
+        for block in self.blocks:
+            h = block(h)
+        
+        # 最终层归一化和输出投影
+        h = self.ln_f(h)
+        logits = self.head(h)
+        
+        return logits
+
+
+class TreeFFNSeq2SeqARC(TreeFFNSeq2Seq):
+    """ARC任务的TreeFFN Seq2Seq"""
+    
+    def __init__(self, vocab_size: int = 17, **kwargs):
+        super().__init__(vocab_size=vocab_size, **kwargs)
 
 
 def calculate_full_accuracy(logits, targets, ignore_index=16):
@@ -47,25 +236,25 @@ def calculate_full_accuracy(logits, targets, ignore_index=16):
     return full_correct / batch_size if batch_size > 0 else 0.0
 
 
-def train_pure_treeffn_model():
-    """训练纯TreeFFN Seq2Seq模型 - 完全并行，无注意力，无自回归"""
+def train_treeffn_seq2seq_model():
+    """训练纯TreeFFN Seq2Seq模型 - 完全并行，无自回归"""
     device = 'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.info(f"🚀 Training Pure TreeFFN Seq2Seq Model on device: {device}")
+    logger.info(f"🚀 Training TreeFFN Seq2Seq Model on device: {device}")
     
-    # 模型配置 - 纯TreeFFN Encoder-Decoder
+    # 模型配置 - 纯TreeFFN Seq2Seq
     model_config = {
         'vocab_size': 17,
         'd_model': 256,
-        'n_layers': 2,
+        'n_layers': 2,  # 每层有3个TreeFFN，所以层数可以少一些
         'max_seq_len': 8192,
         'dropout': 0.1,
-        'tree_iterations': 2,
+        'tree_iterations': 2,  # 稍微少一些加快训练
     }
     
-    # 创建TreeFFN模型
-    model = ARCTreeGPT(**model_config).to(device)
+    # 创建TreeFFN Seq2Seq模型
+    model = TreeFFNSeq2SeqARC(**model_config).to(device)
     
-    # 优化器配置 - 为TreeFFN的T参数设置特殊学习率
+    # 优化器配置 - 为所有TreeFFN的T参数设置特殊学习率
     tree_params = []
     other_params = []
     
@@ -88,7 +277,7 @@ def train_pure_treeffn_model():
     train_dataset = ARCDataset('arc-prize-2025/arc-agi_training_challenges.json', max_length=8192)
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=1,
+        batch_size=1,  # 可以稍大一些，因为是并行处理
         shuffle=True, 
         collate_fn=collate_fn,
         num_workers=0
@@ -102,10 +291,10 @@ def train_pure_treeffn_model():
     
     # 训练循环
     model.train()
-    epochs = 2
+    epochs = 5
     best_val_acc = 0.0
     global_step = 0
-    validation_interval = 300
+    validation_interval = 300  # 每300步验证一次
     
     training_history = {
         'epochs': [],
@@ -118,11 +307,13 @@ def train_pure_treeffn_model():
         'steps': []
     }
     
-    logger.info("🎯 Starting Pure TreeFFN Encoder-Decoder Training:")
+    logger.info("🎯 Starting TreeFFN Encoder-Decoder Training:")
+    logger.info(f"  Model: {model_config}")
     logger.info(f"  Architecture: Encoder TreeFFN + Decoder TreeFFN only")
     logger.info(f"  Pure parallel processing - no attention, no autoregression")
-    logger.info(f"  Each layer has 2 TreeFFN components with {model_config['tree_iterations']} iterations")
+    logger.info(f"  Each block has 2 TreeFFN components with {model_config['tree_iterations']} iterations")
     logger.info(f"  Encoder: left-to-right, Decoder: right-to-left")
+    logger.info(f"  Total TreeFFN components: {model_config['n_layers'] * 2}")
     
     for epoch in range(epochs):
         epoch_loss = 0
@@ -153,7 +344,7 @@ def train_pure_treeffn_model():
             
             optimizer.zero_grad()
             
-            # 纯并行前向传播 - 一次处理整个序列
+            # 纯并行前向传播 - 一次处理整个序列，无自回归
             logits = model(inputs)
             
             # 计算损失
@@ -184,7 +375,7 @@ def train_pure_treeffn_model():
             epoch_full_acc += full_acc
             num_batches += 1
             
-            # 计算TreeFFN的平均T值
+            # 计算所有TreeFFN的平均T值 - 现在每层只有2个TreeFFN
             all_T_values = []
             for block in model.blocks:
                 all_T_values.append(block.encoder_tree_ffn.T.item())
@@ -200,7 +391,7 @@ def train_pure_treeffn_model():
                 'T_avg': f'{avg_T:.2f}'
             })
             
-            # 内存管理
+            # 简单内存管理
             if global_step % 50 == 0:
                 if device == 'mps':
                     torch.mps.empty_cache()
@@ -210,7 +401,7 @@ def train_pure_treeffn_model():
             # 验证
             if global_step % validation_interval == 0:
                 logger.info(f"\\n🎯 Step {global_step}: Running validation...")
-                val_token_acc, val_full_acc, val_samples = evaluate_pure_treeffn_model(
+                val_token_acc, val_full_acc, val_samples = evaluate_treeffn_seq2seq_model(
                     model, eval_dataset, tokenizer, device, max_samples=100
                 )
                 
@@ -244,7 +435,7 @@ def train_pure_treeffn_model():
                         'val_token_acc': val_token_acc,
                         'val_full_acc': val_full_acc,
                         'config': model_config
-                    }, 'best_pure_treeffn.pth')
+                    }, 'best_treeffn_seq2seq.pth')
                     logger.info(f"💾 Saved best model with val full acc {val_full_acc:.4f}")
                 
                 logger.info("-" * 60)
@@ -257,7 +448,7 @@ def train_pure_treeffn_model():
         avg_full_acc = epoch_full_acc / num_batches
         current_lr = optimizer.param_groups[0]['lr']
         
-        # 统计TreeFFN的T值
+        # 统计所有TreeFFN的T值 - 现在每层只有2个TreeFFN
         all_T_values = []
         for block in model.blocks:
             all_T_values.append(block.encoder_tree_ffn.T.item())
@@ -279,16 +470,16 @@ def train_pure_treeffn_model():
         logger.info("=" * 60)
     
     # 保存训练历史
-    with open('training_history_pure_treeffn.json', 'w') as f:
+    with open('training_history_treeffn_seq2seq.json', 'w') as f:
         json.dump(training_history, f, indent=2)
     
-    logger.info("✅ Pure TreeFFN training completed!")
+    logger.info("✅ TreeFFN Seq2Seq training completed!")
     logger.info(f"Best validation accuracy: {best_val_acc:.4f}")
     return model
 
 
-def evaluate_pure_treeffn_model(model, eval_dataset, tokenizer, device, max_samples=100):
-    """评估纯TreeFFN模型"""
+def evaluate_treeffn_seq2seq_model(model, eval_dataset, tokenizer, device, max_samples=100):
+    """评估TreeFFN Seq2Seq模型"""
     model.eval()
     total_token_acc = 0
     total_full_acc = 0
@@ -344,130 +535,30 @@ def evaluate_pure_treeffn_model(model, eval_dataset, tokenizer, device, max_samp
     return avg_token_acc, avg_full_acc, num_batches
 
 
-def evaluate_model(model_path='best_pure_treeffn.pth'):
-    """评估模型在测试集上的性能"""
-    device = 'mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.info(f"Using device: {device}")
-    
-    # 加载模型
-    checkpoint = torch.load(model_path, map_location=device)
-    model_config = checkpoint['config']
-    
-    model = ARCTreeGPT(**model_config).to(device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    logger.info(f"Loaded model from {model_path}")
-    logger.info(f"Best training metrics:")
-    logger.info(f"  Train Loss: {checkpoint.get('train_loss', 'N/A'):.4f}")
-    logger.info(f"  Token Acc: {checkpoint.get('token_acc', 'N/A'):.4f}")
-    logger.info(f"  Full Acc: {checkpoint.get('full_acc', 'N/A'):.4f}")
-    logger.info(f"  Val Token Acc: {checkpoint.get('val_token_acc', 'N/A'):.4f}")
-    logger.info(f"  Val Full Acc: {checkpoint.get('val_full_acc', 'N/A'):.4f}")
-    if 'step' in checkpoint:
-        logger.info(f"  Best model saved at step: {checkpoint['step']}")
-    
-    # 加载测试数据
-    test_dataset = ARCDataset('arc-prize-2025/arc-agi_evaluation_challenges.json', max_length=8192)
-    tokenizer = ARCGridTokenizer()
-    
-    logger.info(f"Loaded {len(test_dataset)} test samples")
-    
-    # 评估
-    logger.info("🎯 Starting evaluation...")
-    test_token_acc, test_full_acc, test_samples = evaluate_pure_treeffn_model(
-        model, test_dataset, tokenizer, device, max_samples=len(test_dataset)
-    )
-    
-    logger.info(f"\\n📊 Final Evaluation Results:")
-    logger.info(f"  Test Token Accuracy: {test_token_acc:.4f}")
-    logger.info(f"  Test Full Sequence Accuracy: {test_full_acc:.4f}")
-    logger.info(f"  Evaluated Samples: {test_samples}")
-    
-    # 保存结果
-    results = {
-        'model_path': model_path,
-        'test_token_accuracy': test_token_acc,
-        'test_full_sequence_accuracy': test_full_acc,
-        'evaluated_samples': test_samples,
-        'training_metrics': {
-            'train_loss': checkpoint.get('train_loss', None),
-            'token_acc': checkpoint.get('token_acc', None),
-            'full_acc': checkpoint.get('full_acc', None),
-            'val_token_acc': checkpoint.get('val_token_acc', None),
-            'val_full_acc': checkpoint.get('val_full_acc', None),
-            'step': checkpoint.get('step', None)
-        }
-    }
-    
-    results_file = 'evaluation_results.json'
-    with open(results_file, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    logger.info(f"💾 Results saved to {results_file}")
-    
-    return results
-
-
-def pure_treeffn_pipeline():
-    """运行纯TreeFFN训练+评估流程"""
-    logger.info("🚀 Starting Pure TreeFFN Pipeline")
-    start_time = time.time()
-    
-    # 检查是否已有训练好的模型
-    if Path('best_pure_treeffn.pth').exists():
-        logger.info("Found existing pure TreeFFN model, skipping training...")
-        logger.info("Delete 'best_pure_treeffn.pth' to retrain from scratch")
-    else:
-        logger.info("Training new pure TreeFFN model...")
-        train_pure_treeffn_model()
-    
-    # 评估模型
-    logger.info("\\n" + "="*60)
-    logger.info("Starting Final Evaluation")
-    logger.info("="*60)
-    
-    evaluate_model('best_pure_treeffn.pth')
-    
-    total_time = time.time() - start_time
-    logger.info(f"\\n🎉 Pipeline completed in {total_time:.2f} seconds")
-    
-    # Final summary
-    logger.info("\\n" + "="*60)
-    logger.info("PURE TREEFFN PIPELINE SUMMARY")
-    logger.info("="*60)
-    logger.info("✅ Pure TreeFFN Encoder-Decoder model trained")
-    logger.info("✅ No attention, no autoregression - complete parallel processing")
-    logger.info("✅ Model evaluated on test set")
-    logger.info("📊 Check 'evaluation_results.json' for detailed metrics")
-    logger.info("📝 Check 'training_history_pure_treeffn.json' for training progress")
-    logger.info("🚀 Ready for analysis and deployment!")
-    logger.info("="*60)
-
-
 def main():
     """主函数"""
-    logger.info("🚀 Starting Pure TreeFFN Seq2Seq Experiment")
+    logger.info("🚀 Starting TreeFFN Seq2Seq Experiment")
     start_time = time.time()
     
     # 训练模型
-    model = train_pure_treeffn_model()
+    model = train_treeffn_seq2seq_model()
     
     total_time = time.time() - start_time
     logger.info(f"\\n🎉 Experiment completed in {total_time:.2f} seconds")
     
     logger.info("\\n" + "="*60)
-    logger.info("PURE TREEFFN EXPERIMENT SUMMARY")
+    logger.info("TREEFFN ENCODER-DECODER EXPERIMENT SUMMARY")
     logger.info("="*60)
     logger.info("✅ Pure TreeFFN architecture - no attention, no autoregression")
     logger.info("✅ Encoder TreeFFN (left-to-right) + Decoder TreeFFN (right-to-left)")
     logger.info("✅ Completely parallel processing - maximum speed")
     logger.info("✅ Simple architecture - only 2 TreeFFN per layer")
     logger.info("✅ Model trained and saved")
-    logger.info("📊 Check 'training_history_pure_treeffn.json' for results")
+    logger.info("📊 Check 'training_history_treeffn_seq2seq.json' for results")
+    logger.info("📝 Compare with complex architectures")
     logger.info("🚀 Simplest and fastest TreeFFN setup!")
     logger.info("="*60)
 
 
 if __name__ == "__main__":
-    pure_treeffn_pipeline()
+    main()

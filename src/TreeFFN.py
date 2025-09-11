@@ -1,14 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_scatter import scatter_add  # pip install torch-scatter
-from typing import Optional, Dict, Tuple
+
 
 class TreeFFN(nn.Module):
     """
     Global Parent‑Child Aggregation MLP.
     可选门控聚合、残差连接、双向传播。
-    优化版本：消息传播计算优化 + 中间结果缓存
     """
 
     def __init__(self,
@@ -55,119 +53,84 @@ class TreeFFN(nn.Module):
         if num_tree_classes is not None:
             self.tree_out = nn.Linear(d_h, num_tree_classes)
 
-        # 缓存变量
-        self._cache: Dict[str, torch.Tensor] = {}
-        self._cache_valid = False
-        self._last_edge_index = None
-
-    def _invalidate_cache(self):
-        """清除缓存"""
-        self._cache.clear()
-        self._cache_valid = False
-
-    def _compute_edge_features(self, h: torch.Tensor, edge_index: torch.LongTensor) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-        """
-        优化的边特征计算 - 移除无效缓存，专注计算优化
-        """
-        # 直接计算，不使用复杂缓存
-        p_idx = edge_index[0]   # 父节点索引
-        c_idx = edge_index[1]   # 子节点索引
-        
-        # 批量获取父子节点特征
-        h_p = h[p_idx]  # [E, d_h]
-        h_c = h[c_idx]  # [E, d_h]
-        
-        # 计算消息 - 优化版本
-        if self.use_edge_proj:
-            # 预计算concatenated features避免重复计算
-            edge_concat = torch.cat([h_p, h_c], dim=1)  # [E, 2*d_h]
-            msg = self.W_edge(edge_concat)  # [E, d_h]
-            gate_input = edge_concat if self.use_gating else None
-        else:
-            # 简单加法更快
-            msg = h_p + h_c  # [E, d_h]
-            gate_input = torch.cat([h_p, h_c], dim=1) if self.use_gating else None
-        
-        return msg, gate_input, p_idx, c_idx
-
-    def _apply_gating(self, msg: torch.Tensor, gate_input: torch.Tensor) -> torch.Tensor:
-        """应用门控机制"""
-        if self.use_gating and gate_input is not None:
-            alpha = torch.sigmoid(self.W_gate(gate_input))  # [E, 1]
-            return msg * alpha
-        return msg
-
-    def _aggregate_messages(self, msg: torch.Tensor, p_idx: torch.Tensor, c_idx: torch.Tensor, N: int) -> torch.Tensor:
-        """
-        极简的消息聚合 - 移除复杂优化，专注速度
-        """
-        # 直接使用scatter_add，最简单的方式
-        agg = torch.zeros(N, msg.size(1), dtype=msg.dtype, device=msg.device)
-        
-        # 分别处理父节点和子节点的消息聚合
-        agg.scatter_add_(0, p_idx.unsqueeze(1).expand(-1, msg.size(1)), msg)
-        agg.scatter_add_(0, c_idx.unsqueeze(1).expand(-1, msg.size(1)), msg)
-        
-        return agg
-
-    def _streaming_forward_step(self, h: torch.Tensor, edge_index: torch.LongTensor, N: int) -> torch.Tensor:
-        """
-        单次迭代的流式前向传播步骤
-        """
-        # 1. 计算边特征（带缓存）
-        msg, gate_input, p_idx, c_idx = self._compute_edge_features(h, edge_index)
-        
-        # 2. 应用门控
-        msg = self._apply_gating(msg, gate_input)
-        
-        # 3. 聚合消息
-        agg = self._aggregate_messages(msg, p_idx, c_idx, N)
-        
-        # 4. 更新隐藏状态
-        if self.bidirectional:
-            h_up = F.relu(self.W_pc(agg) + h)
-            h_down = F.relu(self.W_pc(agg) + h)
-            new_h = torch.cat([h_up, h_down], dim=1)
-        else:
-            new_h = F.relu(self.W_pc(agg) + h)
-            if self.residual:
-                new_h = new_h + h
-        
-        return new_h
-
     # ------------------------------------------------------------------
     def forward(self,
                 node_feats: torch.Tensor,     # [N, d_in]
                 edge_index: torch.LongTensor,  # [2, E]
                 root_idx: int = 0):
         """
-        简化的前向传播：保持T可学习，简化其他计算
+        :param node_feats: 节点原始特征
+        :param edge_index: 父子关系，第一行父节点索引，第二行为子节点索引
+        :param root_idx: 根节点在 node_feats 中的索引
+        :return:
+            - node_logits [N, num_node_classes]  (若设置了)
+            - tree_logit   [1, num_tree_classes] (若设置了)
         """
         N = node_feats.size(0)
-        
+
         # 初始隐藏状态
         h = self.W_s(node_feats)          # [N, d_h]
+
+        # 使用可微分的循环次数 - 软迭代
+        # 为了保持梯度流，我们使用固定的最大迭代次数，但用T来加权每次迭代的贡献
+        max_iterations = 10  # 固定最大迭代次数
         
-        # 使用可学习的T参数，但简化计算
-        max_iterations = max(1, min(int(self.T.item()) + 1, 3))  # 限制最大3次迭代
+        # 初始化累积的隐藏状态
+        accumulated_h = torch.zeros_like(h)
         
-        # 简化迭代处理 - 保持T的梯度
         for step_idx in range(max_iterations):
-            # 计算当前步骤的权重（保持可学习）
-            step_weight = torch.sigmoid(self.T - step_idx)
+            # 计算当前步骤的权重 (sigmoid-based soft gating)
+            step_weight = torch.sigmoid(self.T - step_idx)  # 当T>step_idx时权重较大
             
-            # 执行单步前向传播
-            step_h = self._streaming_forward_step(h, edge_index, N)
+            # ------------------------------------------------------------------
+            # 1️⃣ 计算所有边的消息
+            p_idx = edge_index[0]   # 父节点索引
+            c_idx = edge_index[1]   # 子节点索引
+
+            h_p = h[p_idx]
+            h_c = h[c_idx]
+
+            if self.use_edge_proj:
+                msg = self.W_edge(torch.cat([h_p, h_c], dim=1))  # [E, d_h]
+            else:   # 简单加和
+                msg = h_p + h_c
+
+            if self.use_gating:
+                gate_input = torch.cat([h_p, h_c], dim=1)      # [E, 2*d_h]
+                alpha = torch.sigmoid(self.W_gate(gate_input))  # [E, 1]
+                msg = msg * alpha
+
+            # ------------------------------------------------------------------
+            # 2️⃣ 把消息聚合到每个节点（父子两端都收到）
+             # 创建输出张量
+            agg = torch.zeros(N, msg.size(-1), dtype=msg.dtype, device=msg.device)
+
+              # 第一次聚合
+            agg.scatter_add_(0, p_idx.unsqueeze(-1).expand(-1, msg.size(-1)), msg)
+
+              # 第二次聚合（累加）
+            agg.scatter_add_(0, c_idx.unsqueeze(-1).expand(-1, msg.size(-1)), msg)
+
+            # ------------------------------------------------------------------
+            # 3️⃣ 计算这一步的隐藏状态更新
+            if self.bidirectional:
+                step_h_up   = F.relu(self.W_pc(agg) + h)
+                step_h_down = F.relu(self.W_pc(agg) + h)
+                step_h = torch.cat([step_h_up, step_h_down], dim=1)
+            else:
+                step_h = F.relu(self.W_pc(agg) + h)
+                if self.residual:
+                    step_h = step_h + h
+                    
+            # 用权重累积这一步的贡献
+            accumulated_h = accumulated_h + step_weight * step_h
             
-            # 加权更新（保持T的学习能力）
-            h = h + step_weight * (step_h - h)
-            
-            # 早期停止：如果权重太小，后续迭代贡献很小
-            if step_weight < 0.05:
-                break
-        
-        # 最终隐藏状态
-        final_h = self.dropout(h)
+            # 更新h为这一步的结果，为下一步做准备
+            h = step_h
+
+        # ------------------------------------------------------------------
+        # 4️⃣ 最终隐藏状态 - 使用累积的结果并应用dropout
+        final_h = self.dropout(accumulated_h)
 
         outputs = {}
         
