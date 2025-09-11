@@ -231,7 +231,6 @@ TreeGPT/
 
 ## 🔬 Technical Report
 
-See [letter_to_clem.md](letter_to_clem.md) for a comprehensive technical report on:
 - Simplified architecture approach
 - Preliminary results and metrics  
 - Easy replication instructions
